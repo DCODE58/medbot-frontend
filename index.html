@@ -1380,6 +1380,23 @@ function showTyping() {
   container.scrollTop = container.scrollHeight;
 }
 
+/* Update hint text inside typing bubble while waiting */
+function updateTypingHint(hint) {
+  const row = document.getElementById('typing-row');
+  if (!row) return;
+  row.querySelector('.typing-bubble').innerHTML =
+    `<span style="font-size:.82rem;color:#555;padding:0 2px">${hint}</span>`;
+}
+
+/* Keep-alive ping -- prevents Render free-tier sleeping after 15 min */
+(function startKeepAlive() {
+  const PING_INTERVAL = 8 * 60 * 1000;
+  setInterval(async () => {
+    try { await fetch(`${API_BASE}/health/`, { method: 'GET', cache: 'no-store' }); }
+    catch (_) { /* silent */ }
+  }, PING_INTERVAL);
+})();
+
 function removeTyping() {
   document.getElementById('typing-row')?.remove();
 }
@@ -1421,24 +1438,41 @@ async function sendMessage() {
   isWaiting = true;
   showTyping();
 
-  try {
-    // 30 s timeout -- covers Render free-tier cold starts (~20 s)
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30000);
+  // Progressive status tickers shown while waiting
+  const _t1 = setTimeout(() => updateTypingHint('🔄 Connecting to Dawa…'), 5000);
+  const _t2 = setTimeout(() => updateTypingHint('⏳ Server is starting up, almost there…'), 15000);
+  const _t3 = setTimeout(() => updateTypingHint('🌝 Still working on it, please hold…'), 30000);
 
-    let res;
+  const _clearTickers = () => { clearTimeout(_t1); clearTimeout(_t2); clearTimeout(_t3); };
+
+  async function _doFetch(timeoutMs) {
+    const ctrl  = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      res = await fetch(`${API_BASE}/chat/`, {
+      return await fetch(`${API_BASE}/chat/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, session_id: sessionId }),
-        signal: controller.signal,
+        signal: ctrl.signal,
       });
     } finally {
       clearTimeout(timer);
     }
+  }
 
-    // Parse body regardless of HTTP status so server error messages surface
+  try {
+    let res;
+    try {
+      res = await _doFetch(60000); // 60 s first attempt
+    } catch (firstErr) {
+      if (firstErr.name !== 'AbortError') throw firstErr;
+      // Auto-retry once: server may have just finished waking up
+      updateTypingHint('🔁 Server is awake, retrying…');
+      res = await _doFetch(45000);
+    }
+
+    _clearTickers();
+
     let data;
     try { data = await res.json(); } catch (_) { data = null; }
 
@@ -1471,11 +1505,12 @@ async function sendMessage() {
     }
 
   } catch (err) {
+    _clearTickers();
     removeTyping();
     if (err.name === 'AbortError') {
       renderMessage(
-        '⏳ The server is taking longer than usual — it may be waking up from sleep. '
-        + 'Please wait a moment and send your message again.',
+        '⚠️ The server could not be reached after two attempts. '
+        + 'It may be under heavy load. Please try again in a minute.',
         'bot'
       );
     } else {
